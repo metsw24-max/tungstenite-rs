@@ -94,7 +94,15 @@ pub fn connect_with_config<Req: IntoClientRequest>(
         match try_client_handshake(request, config) {
             Err(Error::Http(res)) if res.status().is_redirection() && attempt < max_redirects => {
                 if let Some(location) = res.headers().get("Location") {
-                    uri = location.to_str()?.parse::<Uri>()?;
+                    let new_uri = location.to_str()?.parse::<Uri>()?;
+                    // A secure `wss://` request must not be silently downgraded to a
+                    // plaintext `ws://` one by following a server-supplied redirect,
+                    // which would replay the original request in clear text.
+                    if is_secure_downgrade(&parts.uri, &new_uri) {
+                        warn!("Refusing redirect that downgrades wss to ws: {new_uri:?}");
+                        return Err(Error::Http(res));
+                    }
+                    uri = new_uri;
                     debug!("Redirecting to {uri:?}");
                     continue;
                 } else {
@@ -135,6 +143,12 @@ fn connect_to_some(addrs: &[SocketAddr], uri: &Uri) -> Result<TcpStream> {
         }
     }
     Err(Error::Url(UrlError::UnableToConnect(uri.to_string())))
+}
+
+/// Whether following a redirect from `from` to `to` would downgrade a secure
+/// `wss://` request to a plaintext `ws://` one.
+fn is_secure_downgrade(from: &Uri, to: &Uri) -> bool {
+    matches!(uri_mode(from), Ok(Mode::Tls)) && matches!(uri_mode(to), Ok(Mode::Plain))
 }
 
 /// Get the mode of the given URL.
@@ -339,5 +353,26 @@ impl IntoClientRequest for ClientRequestBuilder {
             headers.append("Sec-WebSocket-Protocol", protocols);
         }
         Ok(request)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_secure_downgrade;
+    use http::Uri;
+
+    fn uri(s: &str) -> Uri {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn redirect_downgrade_detection() {
+        // wss -> ws is the only combination that must be refused.
+        assert!(is_secure_downgrade(&uri("wss://host/a"), &uri("ws://host/b")));
+        assert!(is_secure_downgrade(&uri("wss://host/a"), &uri("ws://other/b")));
+
+        assert!(!is_secure_downgrade(&uri("wss://host/a"), &uri("wss://other/b")));
+        assert!(!is_secure_downgrade(&uri("ws://host/a"), &uri("wss://other/b")));
+        assert!(!is_secure_downgrade(&uri("ws://host/a"), &uri("ws://other/b")));
     }
 }
